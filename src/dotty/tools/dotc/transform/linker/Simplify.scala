@@ -79,7 +79,7 @@ class Simplify extends MiniPhaseTransform with IdentityDenotTransformer {
   type Transformer = () => (Tree => Tree)
   type Optimization = (Context) => (String, ErasureCompatibility, Visitor, Transformer)
 
-  private lazy val _optimizations = Seq(inlineCaseIntrinsics, inlineLabelsCalledOnce, devalify, dropNoEffects, inlineLocalObjects/*, varify*/)
+  private lazy val _optimizations = Seq(inlineCaseIntrinsics, inlineLabelsCalledOnce, devalify, dropNoEffects, inlineLocalObjects, hoistUpNestedIfElses/*, varify*/)
   override def transformDefDef(tree: tpd.DefDef)(implicit ctx: Context, info: TransformerInfo): tpd.Tree = {
     if (!tree.symbol.is(Flags.Label)) {
       var rhs0 = tree.rhs
@@ -500,13 +500,12 @@ class Simplify extends MiniPhaseTransform with IdentityDenotTransformer {
     ("varify", AfterErasure, visitor, transformer)
   }}
 
-
   private def unzip4[A, B, C, D](seq: Seq[(A, B, C, D)]): (Seq[A], Seq[B], Seq[C], Seq[D]) = {
     val listBuilderA = new ListBuffer[A]()
     val listBuilderB = new ListBuffer[B]()
     val listBuilderC = new ListBuffer[C]()
     val listBuilderD = new ListBuffer[D]()
-    seq.foreach{x =>
+    seq.foreach { x =>
       listBuilderA += x._1
       listBuilderB += x._2
       listBuilderC += x._3
@@ -514,4 +513,20 @@ class Simplify extends MiniPhaseTransform with IdentityDenotTransformer {
     }
     (listBuilderA.toList, listBuilderB.toList, listBuilderC.toList, listBuilderD.toList)
   }
+
+  val hoistUpNestedIfElses: Optimization = (ctx0: Context) => {
+    implicit val ctx = ctx0
+    val visitor: Visitor = {
+      case t: DefDef if t.name.toString == "getFoodFor" => println(t.show)
+      case _ =>
+    }
+    val transformer = () => {
+      val transformation: Tree => Tree = {
+        case t => t
+      }
+      transformation
+    }
+    ("hoistUpNestedIfElses", BeforeErasure, visitor, transformer)
+  }
+
 }
