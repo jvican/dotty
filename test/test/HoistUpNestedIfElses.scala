@@ -16,6 +16,7 @@ object HoistUpNestedIfElses {
       case cw: Cow => Grass
     }
 
+    println("executing hehe")
     require(getFoodFor(Cat("Garfield")) == Meat)
     require(getFoodFor(Cow("UHV")) == Grass)
   }

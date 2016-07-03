@@ -6,9 +6,8 @@ import Contexts._
 import dotty.tools.dotc.ast.Trees._
 import StdNames._
 import NameOps._
-import dotty.tools.dotc.ast.tpd
+import dotty.tools.dotc.ast.{tpd, untpd}
 import Symbols._
-import dotty.tools.dotc.core.Phases.Phase
 import dotty.tools.dotc.core.Types.{ExprType, MethodType, NoPrefix, TermRef, ThisType}
 import dotty.tools.dotc.transform.{Erasure, TreeTransforms}
 import dotty.tools.dotc.transform.TreeTransforms.{MiniPhaseTransform, TransformerInfo}
@@ -18,6 +17,8 @@ import dotty.tools.dotc.core.DenotTransformers.IdentityDenotTransformer
 
 import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
+import dotty.tools.dotc.core.Types.Type
+import dotty.tools.dotc.core.Types.MethodParam
 
 
 class Simplify extends MiniPhaseTransform with IdentityDenotTransformer {
@@ -79,14 +80,13 @@ class Simplify extends MiniPhaseTransform with IdentityDenotTransformer {
   type Transformer = () => (Tree => Tree)
   type Optimization = (Context) => (String, ErasureCompatibility, Visitor, Transformer)
 
-  private lazy val _optimizations = Seq(inlineCaseIntrinsics, inlineLabelsCalledOnce, devalify, dropNoEffects, inlineLocalObjects, hoistUpNestedIfElses/*, varify*/)
+  private lazy val _optimizations = Seq(inlineCaseIntrinsics, inlineLabelsCalledOnce, devalify, dropNoEffects, inlineLocalObjects, specializeBodiesOfInstanceChecks /*, varify*/)
   override def transformDefDef(tree: tpd.DefDef)(implicit ctx: Context, info: TransformerInfo): tpd.Tree = {
     if (!tree.symbol.is(Flags.Label)) {
       var rhs0 = tree.rhs
-      var rhs1: Tree = null
+      var previousRhs: Tree = null
       val erasureCompatibility = if (ctx.erasedTypes) AfterErasure else BeforeErasure
-      while (rhs1 ne rhs0) {
-        rhs1 = rhs0
+      while (previousRhs ne rhs0) {
         val initialized = _optimizations.map(x =>x(ctx.withOwner(tree.symbol)))
         var (names, erasureSupport , visitors, transformers) = unzip4(initialized)
         // todo: fuse for performance
@@ -94,7 +94,11 @@ class Simplify extends MiniPhaseTransform with IdentityDenotTransformer {
           val nextVisitor = visitors.head
           val supportsErasure = erasureSupport.head
           if ((supportsErasure & erasureCompatibility) > 0) {
-            rhs0.foreachSubTree(nextVisitor)
+            rhs0.foreachSubTree { st =>
+              // rhs0 can be a thicket and contains a previous rhs
+              if(st eq previousRhs) ()
+              else nextVisitor(st)
+            }
             val nextTransformer = transformers.head()
             val name = names.head
             val rhst = new TreeMap() {
@@ -103,6 +107,7 @@ class Simplify extends MiniPhaseTransform with IdentityDenotTransformer {
             if (rhst ne rhs0) println(s"${tree.symbol} after ${name} became ${rhst.show}")
             rhs0 = rhst
           }
+          previousRhs = rhs0
           names = names.tail
           visitors = visitors.tail
           erasureSupport = erasureSupport.tail
@@ -514,19 +519,93 @@ class Simplify extends MiniPhaseTransform with IdentityDenotTransformer {
     (listBuilderA.toList, listBuilderB.toList, listBuilderC.toList, listBuilderD.toList)
   }
 
-  val hoistUpNestedIfElses: Optimization = (ctx0: Context) => {
+  /** Hoist up bodies of if expressions whose predicate use `isInstanceOf` to
+    * an outer scope as functions specialized for the type in the predicate.
+    *
+    * The following tree:
+    *
+    *   def target[T](d: D, t: T) =
+    *     if (d.isInstanceOf[A]) bodyTrue
+    *     else bodyFalse
+    *
+    * will be transformed to:
+    *
+    *   def target$d[T](d: A, t: T) = bodyTrue
+    *   def target[T](d: D, t: T) =
+    *     if (d.isInstanceOf[A]) target$d(d)
+    *     else bodyFalse
+    */
+  val specializeBodiesOfInstanceChecks: Optimization = (ctx0: Context) => {
     implicit val ctx = ctx0
+
+    def isInstanceCheck(t: Tree): Boolean = {
+      dropCasts(t) match {
+        case ta @ TypeApply(select, _) =>
+          select.symbol.name.show == "isInstanceOf"
+        case t => false
+      }
+    }
+
+    val targetsToHoistUp = collection.mutable.HashSet[Symbol]()
     val visitor: Visitor = {
-      case t: DefDef if t.name.toString == "getFoodFor" => println(t.show)
+      case defdef: DefDef => defdef.rhs match {
+        case i @ If(cond, thenp, elsep)
+          /* The transformation is enabled only for methods
+           * with if expressions and not blocks with ifs. */
+          if isInstanceCheck(cond) =>
+            targetsToHoistUp += defdef.symbol
+        case _ =>
+      }
       case _ =>
     }
     val transformer = () => {
       val transformation: Tree => Tree = {
+        case defdef: DefDef
+          if targetsToHoistUp.contains(defdef.symbol) =>
+            targetsToHoistUp -= defdef.symbol
+            val If(cond, thenp, elsep) = defdef.rhs
+            val TypeApply(Select(param, _), List(castedTree)) = cond
+            val specializedTpe = castedTree.tpe.finalResultType
+
+            val oldMethodSigTpe = defdef.symbol.info
+            val paramNamess = oldMethodSigTpe.paramNamess
+            val paramTypess = oldMethodSigTpe.paramTypess.iterator
+            val idxs = paramNamess.iterator.map(_.indexWhere(_ == param.symbol.name))
+            val newParamTypess: List[List[Type]] = (idxs zip paramTypess).map { t =>
+              val (idx, pts) = t
+              if(idx == -1) pts
+              else pts.updated(idx, specializedTpe)
+            }.toList
+
+            // Temporary flattening, figure out how to play with
+            // MethodType to represent different lists of parameters
+            val newMethodSigTpe = MethodType(paramNamess.flatten, newParamTypess.flatten, oldMethodSigTpe.resultType)
+            val newMethodSym = ctx.newSymbol(
+              defdef.symbol.owner, ctx.freshName(defdef.name).toTermName,
+              defdef.symbol.flags | Flags.Synthetic, newMethodSigTpe).asTerm
+            val specializedMethod = tpd.polyDefDef(newMethodSym,
+              (tparams: List[Type]) => {
+                (paramss: List[List[Tree]]) =>
+                  paramss.foldLeft(thenp){ (acc, ps) =>
+                    ps.foldLeft(acc) { (acc2, p) =>
+                      if(p.symbol.name == param.symbol.name)
+                        acc2.subst(List(param.symbol), List(p.symbol))
+                      else acc2
+                    }
+                  }
+              }
+            )
+
+            val specializedParam = param.asInstance(specializedTpe)
+            val applied = tpd.ref(specializedMethod.symbol).appliedTo(specializedParam)
+            val rewrittenBody = If(cond, applied, elsep)
+            val newDefDef = cpy.DefDef(defdef)(rhs = rewrittenBody)
+            tpd.Thicket(specializedMethod, newDefDef)
         case t => t
       }
       transformation
     }
-    ("hoistUpNestedIfElses", BeforeErasure, visitor, transformer)
+    ("specializeBodiesOfInstanceChecks", BeforeErasure, visitor, transformer)
   }
 
 }
