@@ -70,6 +70,7 @@ class Compiler {
            new Getters,
            new ClassTags,
            new ElimByName,
+           new ElimCommonSubexpression,
            new AugmentScala2Traits,
            new ResolveSuper,
            new Simplify/*,
