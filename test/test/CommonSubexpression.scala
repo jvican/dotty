@@ -22,6 +22,15 @@ object CommonSubexpression {
     d - c
   }
 
+  def method3: Int = {
+    val a = 1
+    val c = sum(sum(sum(1, a), 2), 1)
+    val d = sum(sum(sum(1, a), 2), 2)
+    assert(c == 5)
+    assert(d == 6)
+    d - c
+  }
+
   def main(args: Array[String]): Unit = {
     println("executing")
     assert(method1 == 1)
