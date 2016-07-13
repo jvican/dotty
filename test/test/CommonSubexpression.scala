@@ -8,16 +8,24 @@ object CommonSubexpression {
 
   def method1: Int = {
     val a = 1
-    val c = sum(sum(1, a), 2)
-    val d = sum(sum(1, a), 3)
-/*    val c = sum(sum(sum(1, a), 2), 3)
-    val d = sum(sum(sum(1, a), 2), 4)*/
+    val c = sum(sum(1, a), 3)
+    val d = sum(sum(1, a), 4)
+    d - c
+  }
+
+  def method2: Int = {
+    val a = 1
+    val c = sum(sum(sum(1, a), 2), 3)
+    val d = sum(sum(sum(1, a), 2), 4)
+    assert(c == 7)
+    assert(d == 8)
     d - c
   }
 
   def main(args: Array[String]): Unit = {
     println("executing")
     assert(method1 == 1)
+    assert(method2 == 1)
   }
 
 }
