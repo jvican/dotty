@@ -90,16 +90,17 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
     val parents = collection.mutable.HashMap[Tree, Tree]()
     val replacements = collection.mutable.HashMap[Tree, Optimized]()
 
+    val childParents = collection.mutable.HashMap[Tree, Tree]()
     val visited = collection.mutable.HashSet[Tree]()
     val cached = collection.mutable.HashMap[Tree, List[IdempotentTree]]()
     val appearances = collection.mutable.HashMap[IdempotentTree, Int]()
 
     @scala.annotation.tailrec
-    def linkChildToParent(trees: List[Tree]): Unit = {
+    def linkChildsToParents(trees: List[IdempotentTree]): Unit = {
       trees match {
         case child :: parent :: tail =>
-          parents += (child -> parent)
-          linkChildToParent(tail)
+          parents += (child.tree -> parent.tree)
+          linkChildsToParents(tail)
         case _ =>
       }
     }
@@ -111,6 +112,7 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
               println(s"idempotent: ${idempotent.tree}")
               val allSubTrees = IdempotentTree.allIdempotentTrees(idempotent)
               cached += idempotent.tree -> allSubTrees
+              linkChildsToParents(allSubTrees.reverse)
               allSubTrees.foreach { st =>
                 val tree = st.tree
                 visited += tree
@@ -122,21 +124,6 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
             case None =>
           }
 
-/*          val idempotentPairs = IdempotentTree.from(tree)
-          val orderedTrees = idempotentPairs.map(_._1).reverse
-          linkChildToParent(orderedTrees)
-
-          idempotentPairs.foreach { p =>
-            alreadyProcessed += p
-            val (_, idempotent) = p
-            val currentCounter = idempotentCounters.getOrElse(idempotent, 0)
-            // TODO: Reorder depending on probability of the predicate
-            if (currentCounter == 0) {
-              idempotentCounters += (idempotent -> 1)
-            } else {
-              idempotentCounters += (idempotent -> (currentCounter + 1))
-            }
-          }*/
       case _ =>
     }
 
@@ -146,13 +133,41 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
       case t =>
     }
 
+    val optimized = collection.mutable.HashMap[Tree, Optimized]()
+
     val transformer: Transformer = () => {
       println(s"got $parents")
 
-      val canBeOptimized = appearances.filter(_._2 > 1)
-      val candidates = canBeOptimized.toList.sortBy(_._2)
+      val optimizationTargets = appearances.filter(_._2 > 1)
+      val candidates = optimizationTargets.toList.sortBy(_._2).map(_._1)
 
-      val alreadyOptimized = collection.mutable.HashSet[IdempotentTree]()
+      @tailrec
+      def getOptimizedParent(tree: Tree): Option[Tree] = {
+        childParents.get(tree) match {
+          case hit @ Some(parent) =>
+            if (optimized.contains(tree)) hit
+            else getOptimizedParent(parent)
+          case None => None
+        }
+      }
+
+      candidates.foreach { c =>
+        val tree = c.tree
+        if (!optimized.contains(tree)) {
+          getOptimizedParent(tree) match {
+            case Some(parent) =>
+              val (parentValDef, parentRef) = optimized(parent)
+
+            case None =>
+              println("HIT")
+              println(s"$tree can be optimized")
+              // Introduce new ValDef
+              // tpd.SyntheticValDef()
+              //
+          }
+        }
+      }
+
       // TODO: Continue algorithm
       println(s"got ${appearances.map(p => p._1.tree -> p._2)}")
 
