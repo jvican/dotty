@@ -3,17 +3,15 @@ package transform
 
 import TreeTransforms._
 import core._
-import DenotTransformers._
 import Symbols._
-import SymDenotations._
 import Contexts._
 import Types._
 import Flags._
-import Decorators._
-import SymUtils._
-import util.Attachment
-import core.StdNames.nme
 import ast.Trees._
+import dotty.tools.dotc.ast.tpd
+import dotty.tools.dotc.transform.IdempotentTree.IdempotentTree
+
+import scala.annotation.tailrec
 
 /** This phase performs Common Subexpression Elimination (CSE) that
   * precomputes an expression into a new variable when it's used
@@ -75,7 +73,7 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
             transformer(super.transform(tree))
         }.transform(rhs0)
         if (rhst ne rhs0)
-          println(s"${tree.symbol} after ${name} became ${rhst.show}")
+          println(s"${tree.symbol} after $name became ${rhst.show}")
         rhs0 = rhst
       }
       if (rhs0 ne tree.rhs) cpy.DefDef(tree)(rhs = rhs0)
@@ -91,10 +89,10 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
 
     val parents = collection.mutable.HashMap[Tree, Tree]()
     val replacements = collection.mutable.HashMap[Tree, Optimized]()
-    // TODO: Should go away with the notion of a new stopping `foreachSubTree`
-    val alreadyProcessed = collection.mutable.HashMap[Tree, Idempotent]()
-    // TODO: Long instead of Int? Unlikely, but just as a precaution
-    val idempotentCounters = collection.mutable.HashMap[Idempotent, Int]()
+
+    val visited = collection.mutable.HashSet[Tree]()
+    val cached = collection.mutable.HashMap[Tree, List[IdempotentTree]]()
+    val appearances = collection.mutable.HashMap[IdempotentTree, Int]()
 
     @scala.annotation.tailrec
     def linkChildToParent(trees: List[Tree]): Unit = {
@@ -107,10 +105,24 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
     }
 
     val analyzer: Visitor = {
-      case tree: Tree
-        if Idempotent.isIdempotent(tree) && !alreadyProcessed.contains(tree) =>
+      case tree: Tree if !visited.contains(tree) =>
+          IdempotentTree.from(tree) match {
+            case Some(idempotent) =>
+              println(s"idempotent: ${idempotent.tree}")
+              val allSubTrees = IdempotentTree.allIdempotentTrees(idempotent)
+              cached += idempotent.tree -> allSubTrees
+              allSubTrees.foreach { st =>
+                val tree = st.tree
+                visited += tree
+                val current = appearances.getOrElse(st, 0)
+                appearances += st -> (current + 1)
+              }
 
-          val idempotentPairs = Idempotent.from(tree)
+              println(allSubTrees.map(_.tree).mkString("\n"))
+            case None =>
+          }
+
+/*          val idempotentPairs = IdempotentTree.from(tree)
           val orderedTrees = idempotentPairs.map(_._1).reverse
           linkChildToParent(orderedTrees)
 
@@ -124,7 +136,7 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
             } else {
               idempotentCounters += (idempotent -> (currentCounter + 1))
             }
-          }
+          }*/
       case _ =>
     }
 
@@ -135,15 +147,15 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
     }
 
     val transformer: Transformer = () => {
-      println(s"got $candidates")
       println(s"got $parents")
 
-      val canBeOptimized = idempotentCounters.filter(_._2 > 1)
+      val canBeOptimized = appearances.filter(_._2 > 1)
       val candidates = canBeOptimized.toList.sortBy(_._2)
 
-      val alreadyOptimized = collection.mutable.HashSet[Idempotent]()
+      val alreadyOptimized = collection.mutable.HashSet[IdempotentTree]()
       // TODO: Continue algorithm
-      
+      println(s"got ${appearances.map(p => p._1.tree -> p._2)}")
+
       val transformation: Tree => Tree = {
         case t => t
       }
@@ -153,109 +165,102 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
     ("elimCommonSubexpression", visitor, transformer)
   }
 
-  /** TODO: Document this and especially the depth field */
-  case class Idempotent(fun: Symbol,
-                        qual: Symbol,
-                        depth: Int,
-                        typeParams: List[Type],
-                        args: List[List[Type]])(implicit ctx: Context) {
+}
 
+object IdempotentTree {
+
+  import ast.tpd._
+
+  class IdempotentTree(val tree: tpd.Tree)(implicit ctx: Context) {
+
+    import scala.util.hashing.MurmurHash3.{seqHash, mix}
+
+    /** Witness of structural equality by inspecting the tree */
+    def idempotentHashCode(t: Tree)(implicit ctx: Context): Int = {
+      t match {
+        case EmptyTree => EmptyTree.hashCode()
+        case _: This => t.symbol.hashCode()
+        case _: Super => t.symbol.hashCode()
+        case _: Ident => t.symbol.hashCode()
+        case Literal(constant) => constant.value.hashCode()
+        case Select(qual, name) =>
+          mix(name.hashCode(), idempotentHashCode(qual))
+        case Apply(fun1, args1) =>
+          val idempotents = seqHash(args1.map(idempotentHashCode))
+          mix(idempotentHashCode(fun1), idempotents)
+        case TypeApply(fun1, targs1) =>
+          val idempotents = seqHash(targs1.map(idempotentHashCode))
+          mix(idempotentHashCode(fun1), idempotents)
+        // TODO: Case for `Typed`
+        case _ => 0 // impossible case
+      }
+    }
+
+    override def hashCode(): Int = idempotentHashCode(this.tree)
+
+    /** Compare idempotent trees by structural equality */
     override def equals(that: Any): Boolean = that match {
-      case that: Idempotent =>
-        if (this eq that) true
-        else if (fun != that.fun) false
-        else if (depth != that.depth) false
-        else if (qual != that.qual) false
-        else if (typeParams.size != that.typeParams.size) false
-        else if (typeParams zip that.typeParams exists (t => !(t._1 =:= t._2)))
-          false
-        else if (args.size != that.args.size) false
-        else
-          (args zip that.args) forall {
-            case (a1s, a2s) =>
-              a1s.size == a2s.size && (a1s zip a2s).forall(t => t._1 =:= t._2)
-          }
-
+      case thatIdempotent: IdempotentTree =>
+        this.hashCode() == thatIdempotent.hashCode()
       case _ => false
     }
-
-    override def hashCode: Int = fun.hashCode + qual.hashCode
   }
 
-  object Idempotent {
+  import ast._
+  import ast.tpd._
 
-    /** Return *all* the possible idempotent instances paired up
-      * with the original trees from which they were generating.
-      *
-      * The passed [[tree]] must be idempotent.
-      *
-      * The list of idempotent instances needs to be ordered by
-      * instances built from the outside to the inside.
-      */
-    def from(tree: Tree)(implicit ctx: Context): List[(Tree, Idempotent)] = {
-      def canBeFactoredOut(sym: Symbol) =
-        if (sym is Method) true
-        else (sym is Lazy) && !(sym is JavaDefined)
+  // Never call directly without having checked that it's indeed idempotent
+  def apply(tree: Tree)(implicit ctx: Context): IdempotentTree =
+    new IdempotentTree(tree)
 
-      def accumulate(tree: Tree,
-                     original: Tree,
-                     qual: Symbol,
-                     depth: Int,
-                     typeParams: List[Type],
-                     argss: List[List[Type]]): List[(Tree, Idempotent)] = {
-        tree match {
-          case i: Ident if canBeFactoredOut(tree.symbol) =>
-            List(original -> Idempotent(tree.symbol, qual, depth, typeParams, argss))
+  def from(tree: Tree)(implicit ctx: Context): Option[IdempotentTree] =
+    if (isIdempotent(tree)) Some(new IdempotentTree(tree)) else None
 
-          case Apply(fun, args) =>
-            val tpes = args.map(_.tpe)
-            val withoutApply = args.map(a => accumulate(a, a, NoSymbol, depth + 1, Nil, Nil))
-            val withApply = accumulate(fun, original, qual, depth, typeParams, tpes :: argss)
-            withApply ::: withoutApply.reduce(_ ++ _)
-
-          case TypeApply(fun, targs) =>
-            accumulate(fun, original, qual, depth, targs.map(_.tpe) ::: typeParams, argss)
-
-          case Select(qual, _) if canBeFactoredOut(tree.symbol) =>
-            val withoutSelect = accumulate(qual, qual, NoSymbol, depth + 1, Nil, Nil)
-            val withSelect = original -> Idempotent(tree.symbol, qual.symbol, depth, typeParams, argss)
-            withSelect :: withoutSelect
-
-          case Typed(expr, _) => accumulate(expr, tree, qual, depth, typeParams, argss)
-
-          case _ => Nil
-        }
-      }
-
-      // Assume that tree is idempotent
-      accumulate(tree, tree, NoSymbol, 0, Nil, Nil)
-        .filter(tp => isValid(tp._2))
+  def isIdempotent(tree: Tree)(implicit ctx: Context): Boolean = {
+    /** We consider idempotent expressions known to be initialized once
+      * (lazy vals and vals), and methods annotated with `Idempotent` */
+    def isIdempotentRef(tree: Tree): Boolean = {
+      val sym = tree.symbol
+      if (sym hasAnnotation defn.IdempotentAnnot) true // @Idempotent
+      else if (sym is Lazy) true // lazy val and singleton objects
+      else !(sym is Mutable) && !(sym is Method) // val
     }
 
-    def isValid(idem: Idempotent): Boolean =
-      idem.typeParams.nonEmpty || idem.args.nonEmpty
+    tree match {
+      case EmptyTree | This(_) | Super(_, _) | Literal(_) => true
+      case Ident(_) => isIdempotentRef(tree)
+      case Select(qual, _) => isIdempotent(qual) && isIdempotentRef(tree)
+      case TypeApply(fn, _) => isIdempotent(fn)
+      case Apply(fn, args) => isIdempotent(fn) && (args forall isIdempotent)
+      case Typed(expr, _) => isIdempotent(expr)
+      case _ => false
+    }
+  }
 
-    def isIdempotent(tree: Tree)(implicit ctx: Context): Boolean = {
-      /** We consider idempotent expressions known to be initialized once
-        * (lazy vals and vals), and methods annotated with `Idempotent` */
-      def isIdempotentRef(tree: Tree): Boolean = {
-        val sym = tree.symbol
-        if (sym hasAnnotation defn.IdempotentAnnot) true // @Idempotent
-        else if (sym is Lazy) true // lazy val and singleton objects
-        else !(sym is Mutable) && !(sym is Method) // val
-      }
-
-      tree match {
-        case EmptyTree | This(_) | Super(_, _) | Literal(_) => true
-        case Ident(_) => isIdempotentRef(tree)
-        case Select(qual, _) => isIdempotent(qual) && isIdempotentRef(tree)
-        case TypeApply(fn, _) => isIdempotent(fn)
-        case Apply(fn, args) => isIdempotent(fn) && (args forall isIdempotent)
-        case Typed(expr, _) => isIdempotent(expr)
-        case _ => false
-      }
+  /** Collects all the idempotent sub trees, including the original tree. */
+  def allIdempotentTrees(t1: IdempotentTree)
+                        (implicit ctx: Context): List[IdempotentTree] = {
+    // TODO: Pending to remove Typed casts to remove comparison failures
+    def collect(isTopTree: Boolean, tree: Tree): List[IdempotentTree] = tree match {
+      case EmptyTree | This(_) | Super(_, _) | Literal(_) | Ident(_) => Nil
+      case Select(qual, _) =>
+        if (isTopTree) IdempotentTree(tree) :: collect(isTopTree = false, qual)
+        else collect(isTopTree, qual)
+      case TypeApply(fn, _) =>
+        if(isTopTree) IdempotentTree(tree) :: collect(isTopTree = false, fn)
+        else collect(isTopTree, fn)
+      case Apply(fn, args) =>
+        val branched = args.map(collect(true, _)).reduce(_ ++ _)
+        if(isTopTree) IdempotentTree(tree) :: collect(isTopTree = false, fn) ::: branched
+        else collect(isTopTree, fn) ::: branched
+      case Typed(expr, _) =>
+        if(isTopTree) IdempotentTree(tree) :: collect(isTopTree = false, expr)
+        else collect(isTopTree, expr)
+      case _ => Nil // Impossible case, t1 is idempotent
     }
 
+    collect(isTopTree = true, t1.tree)
   }
 
 }
+
