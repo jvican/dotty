@@ -285,7 +285,7 @@ object IdempotentTree {
         case _: This => t.symbol.hashCode()
         case _: Super => t.symbol.hashCode()
         case _: Ident => t.symbol.hashCode()
-        case Literal(constant) => constant.value.hashCode()
+        case Literal(constant) => if (constant.value == null) 0 else constant.value.hashCode()
         case Select(qual, name) =>
           mix(name.hashCode(), idempotentHashCode(qual))
         case Apply(fun1, args1) =>
