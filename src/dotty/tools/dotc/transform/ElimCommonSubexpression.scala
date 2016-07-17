@@ -49,6 +49,8 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
 
   override def phaseName = "elimCommonSubexpression"
 
+  private final val debug = true
+
   override def runsAfter = Set(classOf[ElimByName])
 
   /* Imitate `Simplify` structure for the moment being */
@@ -249,6 +251,7 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
           // Introduce new val defs for this enclosing tree
           val optimizedValDefs = hostsOfOptimizations(enclosingTree.symbol)
           hostsOfOptimizations -= enclosingTree.symbol
+          if (debug && optimizedValDefs.nonEmpty) println(s"introducing ${optimizedValDefs.map(_.show)}")
           tpd.Thicket(optimizedValDefs ::: List(enclosingTree))
 
         case tree =>
@@ -258,7 +261,10 @@ class ElimCommonSubexpression extends MiniPhaseTransform {
               /* We need to check if it's idempotent again because sub trees
                * may have changed/optimized and tree equality doesn't hold */
               IdempotentTree.from(tree) match {
-                case Some(itree) => changeReference(itree, tree)
+                case Some(itree) =>
+                  val ret = changeReference(itree, tree)
+                  if (debug && ret ne tree) println(s"rewriting ${tree.show} to ${ret.show}")
+                  ret
                 case None => tree
               }
           }
